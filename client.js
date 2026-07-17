@@ -4,146 +4,34 @@ const { encrypt } = require("./encryption");
 
 class AirpayClient {
 
-    /**
-     * @type {AirpayClient | null}
-     */
-    static instance = null;
-
-    /**
-     * @type {Promise<string> | null}
-     */
-    tokenPromise = null;
-
-    /**
-     * @private
-     * @param {Object} config
-     */
-    constructor(config) {
-        this.config = config;
-
-        /**
-         * @private
-         * @type {string|null}
-         */
-        this.accessToken = null;
-
-        /**
-         * Epoch time in milliseconds.
-         *
-         * @private
-         * @type {number}
-         */
-        this.tokenExpiresAt = 0;
-
-        this.http = axios.create({
-            timeout: 30000
-        });
+    constructor() {
+        // load from environment variables
+        this.config = {
+            USERNAME: '',
+            PASSWORD: '',
+            SECRET: '',
+            MERCHANT_ID: '',
+            CLIENT_ID: '',
+            CLIENT_SECRET: '',
+            TOKEN_URL: '',
+            URL: ''
+        }
     }
 
     /**
-     * Initialize singleton.
-     *
-     * @param {Object} config
-     * @returns {AirpayClient}
-     */
-    static initialize(config) {
-
-        if (!AirpayClient.instance) {
-            AirpayClient.instance = new AirpayClient(config);
-        }
-
-        return AirpayClient.instance;
-
-    }
-
-    /**
-     * Get singleton instance.
-     *
-     * @returns {AirpayClient}
-     */
-    static getInstance() {
-
-        if (!AirpayClient.instance) {
-            throw new Error(
-                "AirpayClient is not initialized."
-            );
-        }
-
-        return AirpayClient.instance;
-
-    }
-
-    /**
-     * Returns a valid OAuth access token.
-     *
-     * Automatically refreshes when expired.
-     *
-     * @returns {Promise<string>}
-     */
-    async getAccessToken() {
-
-        if (
-            this.accessToken &&
-            Date.now() < this.tokenExpiresAt
-        ) {
-            return this.accessToken;
-        }
-
-        if (this.tokenPromise) {
-            return this.tokenPromise;
-        }
-
-        this.tokenPromise = this.refreshAccessToken();
-
-        try {
-            return await this.tokenPromise;
-        } finally {
-            this.tokenPromise = null;
-        }
-
-    }
-
-    /**
-     * Fetch a new OAuth token.
-     *
-     * @private
-     * @returns {Promise<string>}
-     */
-    async refreshAccessToken() {
-
-        const response = await this.http.post(
-            this.config.oauthUrl,
-            {
-                client_id: this.config.clientId,
-                client_secret: this.config.clientSecret,
-                grant_type: "client_credentials"
-            }
-        );
-
-        const data = response.data;
-        this.accessToken = data.access_token;
-
-        // Refresh one minute before expiry.
-        this.tokenExpiresAt =
-            Date.now() +
-            ((data.expires_in - 60) * 1000);
-
-        return this.accessToken;
-    }
-
-    /**
-     * Generate private key.
+     * Returns the Airpay encryption key
      *
      * @returns {string}
      */
-    generatePrivateKey() {
+    getEncryptionKey() {
 
         return crypto
-            .createHash("sha256")
+            .createHash("md5")
             .update(
-                `${this.config.secret}@${this.config.username}:|:${this.config.password}`
+                `${this.config.USERNAME}~:~${this.config.PASSWORD}`
             )
             .digest("hex");
+
     }
 
     /**
@@ -154,56 +42,176 @@ class AirpayClient {
      */
     encryptPayload(payload) {
 
-        return encrypt(
-            JSON.stringify(payload),
-            this.config.secretKey
+        const key = this.getEncryptionKey();
+
+        const iv = crypto.randomBytes(8).toString("hex");
+
+        const cipher = crypto.createCipheriv(
+            "aes-256-cbc",
+            Buffer.from(key),
+            Buffer.from(iv)
         );
+
+        const raw = Buffer.concat([
+            cipher.update(JSON.stringify(payload), "utf8"),
+            cipher.final()
+        ]);
+
+        return iv + raw.toString("base64");
+
     }
 
-    /**
-     * Replace with official Airpay checksum algorithm.
-     *
-     * @param {Object} payload
-     * @returns {string}
-     */
-    generateChecksum(payload) {
+    generatePrivateKey() {
 
-        const value = Object.keys(payload)
-            .sort()
-            .map(key => payload[key] ?? "")
-            .join("");
         return crypto
             .createHash("sha256")
-            .update(value)
+            .update(
+                `${this.config.SECRET}@${this.config.USERNAME}:|:${this.config.PASSWORD}`
+            )
+            .digest("hex");
+    }
+
+    calculateChecksum(payload) {
+
+        const sorted = Object.keys(payload)
+            .sort()
+            .reduce((obj, key) => {
+                obj[key] = payload[key];
+                return obj;
+            }, {});
+
+        const values = Object
+            .values(sorted)
+            .join("");
+
+        const today = new Date()
+            .toISOString()
+            .split("T")[0];
+
+        return crypto
+            .createHash("sha256")
+            .update(values + today)
             .digest("hex");
 
     }
-    /**
-     * Creates the request required by Airpay.
-     *
-     * @param {Object} payload
-     * @returns {Promise<Object>}
-     */
-    async createPaymentRequest(payload) {
 
-        const token = await this.getAccessToken();
-        return {
-            paymentUrl: `${this.config.paymentUrl}?token=${token}`,
-            merchant_id: this.config.merchantId,
-            privatekey: this.generatePrivateKey(),
-            checksum: this.generateChecksum(payload),
-            encdata: this.encryptPayload(payload)
+    /**
+     * Returns a valid Airpay OAuth token.
+     *
+     * @returns {Promise<string>}
+     */
+    async getToken() {
+
+        // Return cached token if still valid.
+        if (
+            this.accessToken &&
+            Date.now() < this.tokenExpiresAt
+        ) {
+            return this.accessToken;
+        }
+
+        // Another request is already refreshing the token.
+        if (this.refreshPromise) {
+            return this.refreshPromise;
+        }
+
+        this.refreshPromise = this.fetchToken();
+
+        try {
+            return await this.refreshPromise;
+        } finally {
+            this.refreshPromise = null;
+        }
+
+    }
+
+    /**
+     * Fetch a new OAuth access token.
+     *
+     * @private
+     * @returns {Promise<string>}
+     */
+    async fetchToken() {
+
+        const request = {
+            client_id: this.config.CLIENT_ID,
+            client_secret: this.config.CLIENT_SECRET,
+            grant_type: "client_credentials",
+            merchant_id: this.config.MERCHANT_ID
         };
 
+        const response = await axios.post(
+            this.config.TOKEN_URL,
+            {
+                merchant_id: this.config.MERCHANT_ID,
+                encdata: this.encryptPayload(request),
+                checksum: this.calculateCheckSum(request)
+            }
+        );
+
+        const result = this.decryptPayload(
+            response.data.response
+        );
+
+        if (result.status !== "success") {
+            throw new Error(result.message);
+        }
+
+        this.accessToken = result.data.access_token;
+
+        // Refresh 30 seconds before expiry.
+        this.tokenExpiresAt =
+            Date.now() +
+            ((result.data.expires_in - 30) * 1000);
+
+        return this.accessToken;
+
     }
     /**
-     * Clears cached token.
-     * Useful after authentication failures.
+     * Decrypts an Airpay encrypted response.
+     *
+     * Response format:
+     * <16-char IV><Base64 Cipher Text>
+     *
+     * @param {string} encryptedPayload
+     * @returns {Object}
      */
-    clearToken() {
-        this.accessToken = null;
-        this.tokenExpiresAt = 0;
+    decryptPayload(encryptedPayload) {
+
+        const key = Buffer.from(
+            this.getEncryptionKey(),
+            "utf8"
+        );
+
+        // First 16 characters are the IV
+        const iv = Buffer.from(
+            encryptedPayload.substring(0, 16),
+            "utf8"
+        );
+
+        // Remaining string is Base64 cipher text
+        const cipherText = Buffer.from(
+            encryptedPayload.substring(16),
+            "base64"
+        );
+
+        const decipher = crypto.createDecipheriv(
+            "aes-256-cbc",
+            key,
+            iv
+        );
+
+        const decrypted = Buffer.concat([
+            decipher.update(cipherText),
+            decipher.final()
+        ]);
+
+        return JSON.parse(
+            decrypted.toString("utf8")
+        );
+
     }
+
 }
 
 module.exports = AirpayClient;
