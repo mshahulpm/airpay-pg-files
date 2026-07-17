@@ -1,6 +1,5 @@
 const axios = require("axios");
 const crypto = require("node:crypto");
-const { encrypt } = require("./encryption");
 
 class AirpayClient {
 
@@ -212,6 +211,32 @@ class AirpayClient {
 
     }
 
+    /**
+     * Creates an Airpay payment request.
+     *
+     * @param {Object} payload
+     * @returns {Promise<{
+     *   url: string,
+     *   merchantId: string,
+     *   privateKey: string,
+     *   checksum: string,
+     *   encData: string
+     * }>}
+     */
+    async createPayment(payload) {
+
+        const token = await this.getToken();
+
+        return {
+            url: `${this.config.URL}?token=${encodeURIComponent(token)}`,
+            merchantId: this.config.MERCHANT_ID,
+            privateKey: this.generatePrivateKey(),
+            checksum: this.calculateCheckSum(payload),
+            encData: this.encryptPayload(payload)
+        };
+
+    }
+
 }
 
-module.exports = AirpayClient;
+module.exports = new AirpayClient();
